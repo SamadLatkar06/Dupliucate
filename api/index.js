@@ -30,10 +30,6 @@ const supabase =
 
 let cvPromise;
 
-/* =========================================================
-   BASIC ROUTES
-========================================================= */
-
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
@@ -42,7 +38,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// Temporary route to verify that this exact file is deployed.
 app.get("/debug-route-check", (req, res) => {
   res.status(200).json({
     success: true,
@@ -60,10 +55,6 @@ app.get("/health", async (req, res) => {
     supabaseHostConfigured: Boolean(supabaseHost)
   });
 });
-
-/* =========================================================
-   OPENCV INITIALIZATION
-========================================================= */
 
 async function getCV() {
   if (cvPromise) return cvPromise;
@@ -96,17 +87,12 @@ async function getCV() {
 
     return cv;
   })().catch((error) => {
-    // Permit a later request to retry initialization.
     cvPromise = null;
     throw error;
   });
 
   return cvPromise;
 }
-
-/* =========================================================
-   IMAGE DOWNLOAD AND VALIDATION
-========================================================= */
 
 async function loadImageFromUrl(imageUrl) {
   if (!supabaseHost) {
@@ -145,7 +131,6 @@ async function loadImageFromUrl(imageUrl) {
     throw new Error("URL did not return an image");
   }
 
-  // Read at most 8 MB plus one byte to enforce the limit.
   const reader = response.body.getReader();
   const chunks = [];
   let totalBytes = 0;
@@ -184,10 +169,6 @@ async function loadImageFromUrl(imageUrl) {
   };
 }
 
-/* =========================================================
-   OPENCV HELPERS
-========================================================= */
-
 function makeMat(cv, image) {
   const mat = new cv.Mat(
     image.height,
@@ -213,7 +194,6 @@ async function compareImageUrls(imageUrlA, imageUrlB) {
 
   try {
     const cv = await getCV();
-
     const ORB = cv.ORB || cv.ORB_create;
 
     if (!ORB || !cv.BFMatcher) {
@@ -298,16 +278,12 @@ async function compareImageUrls(imageUrlA, imageUrlB) {
         try {
           item.delete();
         } catch (_) {
-          // Ignore native/WASM cleanup errors.
+          // Ignore cleanup errors.
         }
       }
     });
   }
 }
-
-/* =========================================================
-   COMPARE TWO IMAGES
-========================================================= */
 
 app.post("/compare", async (req, res) => {
   try {
@@ -340,10 +316,6 @@ app.post("/compare", async (req, res) => {
   }
 });
 
-/* =========================================================
-   FIND POSSIBLE DUPLICATE COMPLAINTS
-========================================================= */
-
 app.get("/duplicate-complaints", async (req, res) => {
   if (!supabase) {
     return res.status(500).json({
@@ -361,6 +333,8 @@ app.get("/duplicate-complaints", async (req, res) => {
     });
   }
 
+  let failedStage = "supabase_query";
+
   try {
     const { data: complaints, error } = await supabase
       .from("complaints")
@@ -370,8 +344,17 @@ app.get("/duplicate-complaints", async (req, res) => {
       .order("created_at", { ascending: false })
       .limit(200);
 
-    if (error) throw error;
+    if (error) {
+      const supabaseError = new Error(
+        error.message || "Supabase query failed"
+      );
+      supabaseError.code = error.code;
+      supabaseError.details = error.details;
+      supabaseError.hint = error.hint;
+      throw supabaseError;
+    }
 
+    failedStage = "group_complaints";
     const groups = new Map();
 
     let missingLocation = 0;
@@ -421,7 +404,9 @@ app.get("/duplicate-complaints", async (req, res) => {
       groups.get(key).push(complaint);
     }
 
+    failedStage = "compare_images";
     const duplicates = [];
+    const comparisonErrors = [];
     let comparisons = 0;
     let failedComparisons = 0;
     let comparisonLimitReached = false;
@@ -441,7 +426,6 @@ app.get("/duplicate-complaints", async (req, res) => {
           const a = roomComplaints[i];
           const b = roomComplaints[j];
 
-          // Identical stored URLs need no image comparison.
           if (a.image_url === b.image_url) continue;
 
           comparisons++;
@@ -464,6 +448,17 @@ app.get("/duplicate-complaints", async (req, res) => {
             }
           } catch (error) {
             failedComparisons++;
+
+            if (comparisonErrors.length < 5) {
+              comparisonErrors.push({
+                complaintAId: a.id,
+                complaintBId: b.id,
+                message: error.message || String(error),
+                cause: error.cause
+                  ? String(error.cause.message || error.cause)
+                  : null
+              });
+            }
 
             console.error(
               `Comparison failed for complaint IDs ${a.id}, ${b.id}:`,
@@ -496,23 +491,36 @@ app.get("/duplicate-complaints", async (req, res) => {
       duplicateCount: duplicates.length,
       duplicates,
       failedComparisons,
+      comparisonErrors,
       message: comparisons === 0
         ? "No image pairs were compared. Check image URLs and hostel/room grouping."
         : "Results are possible duplicates, not confirmed duplicates."
     });
   } catch (error) {
-    console.error("Duplicate scan error:", error.message);
+    const causeMessage = error.cause
+      ? String(error.cause.message || error.cause)
+      : null;
+
+    console.error("Duplicate scan error:", {
+      stage: failedStage,
+      message: error.message,
+      code: error.code || null,
+      details: error.details || null,
+      hint: error.hint || null,
+      cause: causeMessage
+    });
 
     return res.status(500).json({
       success: false,
       error: "Could not scan complaints",
-      details: error.message
+      stage: failedStage,
+      details: error.message || String(error),
+      code: error.code || null,
+      supabaseDetails: error.details || null,
+      hint: error.hint || null,
+      cause: causeMessage
     });
   }
 });
-
-/* =========================================================
-   EXPORT FOR VERCEL
-========================================================= */
 
 module.exports = app;
