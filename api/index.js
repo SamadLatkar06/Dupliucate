@@ -56,6 +56,34 @@ app.get("/health", async (req, res) => {
   });
 });
 
+app.get("/debug-config", (req, res) => {
+  const rawUrl = process.env.SUPABASE_URL || "";
+  const configuredHost = (process.env.SUPABASE_HOST || "")
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+
+  let urlHost = null;
+
+  try {
+    urlHost = new URL(rawUrl).hostname;
+  } catch (_) {
+    // URL is missing or invalid.
+  }
+
+  return res.status(200).json({
+    success: true,
+    supabaseUrlConfigured: Boolean(rawUrl),
+    supabaseUrlHost: urlHost,
+    supabaseHostConfigured: Boolean(configuredHost),
+    supabaseHost: configuredHost || null,
+    hostnamesMatch: Boolean(
+      urlHost && configuredHost && urlHost === configuredHost
+    ),
+    supabaseClientCreated: Boolean(supabase)
+  });
+});
+
 async function getCV() {
   if (cvPromise) return cvPromise;
 
