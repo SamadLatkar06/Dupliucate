@@ -13,7 +13,10 @@ app.use(express.json({ limit: "1mb" }));
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabaseHost = process.env.SUPABASE_HOST;
+const supabaseHost = (process.env.SUPABASE_HOST || "")
+  .trim()
+  .replace(/^https?:\/\//, "")
+  .replace(/\/+$/, "");
 
 const supabase =
   supabaseUrl && supabaseKey
@@ -27,100 +30,147 @@ const supabase =
 
 let cvPromise;
 
+/* =========================================================
+   BASIC ROUTES
+========================================================= */
+
+app.get("/", (req, res) => {
+  res.status(200).json({
+    success: true,
+    service: "HosPro Duplicate Complaints API",
+    message: "API is running"
+  });
+});
+
+// Temporary route to verify that this exact file is deployed.
+app.get("/debug-route-check", (req, res) => {
+  res.status(200).json({
+    success: true,
+    source: "api/index.js",
+    message: "Correct Express function is running"
+  });
+});
+
+app.get("/health", async (req, res) => {
+  res.status(200).json({
+    success: true,
+    service: "HosPro Duplicate Complaints API",
+    opencvPackageLoaded: Boolean(cvModule),
+    supabaseConfigured: Boolean(supabase),
+    supabaseHostConfigured: Boolean(supabaseHost)
+  });
+});
+
+/* =========================================================
+   OPENCV INITIALIZATION
+========================================================= */
+
 async function getCV() {
   if (cvPromise) return cvPromise;
 
   cvPromise = (async () => {
-    if (cvModule.Mat && cvModule.ORB) return cvModule;
+    let cv = cvModule;
 
-    if (typeof cvModule.then === "function") {
-      return await cvModule;
+    if (cv && typeof cv.then === "function") {
+      cv = await cv;
+    }
+
+    if (cv && cv.Mat && (cv.ORB || cv.ORB_create)) {
+      return cv;
+    }
+
+    if (!cv) {
+      throw new Error("OpenCV module could not be loaded");
     }
 
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error("OpenCV initialization timed out")),
-        15000
-      );
+      const timeout = setTimeout(() => {
+        reject(new Error("OpenCV initialization timed out"));
+      }, 15000);
 
-      cvModule.onRuntimeInitialized = () => {
+      cv.onRuntimeInitialized = () => {
         clearTimeout(timeout);
         resolve();
       };
     });
 
-    return cvModule;
-  })();
+    return cv;
+  })().catch((error) => {
+    // Permit a later request to retry initialization.
+    cvPromise = null;
+    throw error;
+  });
 
   return cvPromise;
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    service: "HosPro Duplicate Complaints API"
-  });
-});
+/* =========================================================
+   IMAGE DOWNLOAD AND VALIDATION
+========================================================= */
 
-app.get("/health", async (req, res) => {
-  try {
-    const cv = await getCV();
-
-    res.json({
-      success: true,
-      service: "HosPro Duplicate Complaints API",
-      openCVLoaded: Boolean(cv.Mat),
-      orbAvailable: Boolean(cv.ORB || cv.ORB_create),
-      supabaseConfigured: Boolean(supabase)
-    });
-  } catch (error) {
-    console.error("Health error:", error.message);
-
-    res.status(500).json({
-      success: false,
-      error: "Service initialization failed"
-    });
-  }
-});
-
-async function loadImageFromUrl(url) {
+async function loadImageFromUrl(imageUrl) {
   if (!supabaseHost) {
     throw new Error("SUPABASE_HOST is not configured");
   }
 
-  const parsed = new URL(url);
+  let parsedUrl;
 
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.hostname !== supabaseHost ||
-    parsed.username ||
-    parsed.password
-  ) {
-    throw new Error("Image URL is not from the configured Supabase host");
+  try {
+    parsedUrl = new URL(imageUrl);
+  } catch {
+    throw new Error("Invalid image URL");
   }
 
-  const response = await fetch(url, {
+  if (
+    parsedUrl.protocol !== "https:" ||
+    parsedUrl.hostname !== supabaseHost ||
+    parsedUrl.username ||
+    parsedUrl.password
+  ) {
+    throw new Error("Image URL host does not match SUPABASE_HOST");
+  }
+
+  const response = await fetch(parsedUrl.toString(), {
     signal: AbortSignal.timeout(10000),
     redirect: "error"
   });
 
   if (!response.ok) {
-    throw new Error("Unable to download image");
+    throw new Error(`Image download failed: HTTP ${response.status}`);
   }
 
   const contentType = response.headers.get("content-type") || "";
 
-  if (!contentType.startsWith("image/")) {
+  if (!contentType.toLowerCase().startsWith("image/")) {
     throw new Error("URL did not return an image");
   }
 
-  const buffer = Buffer.from(await response.arrayBuffer());
+  // Read at most 8 MB plus one byte to enforce the limit.
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
 
-  if (buffer.length > 8 * 1024 * 1024) {
-    throw new Error("Image must be smaller than 8 MB");
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      totalBytes += value.length;
+
+      if (totalBytes > 8 * 1024 * 1024) {
+        await reader.cancel();
+        throw new Error("Image must be smaller than 8 MB");
+      }
+
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
   }
 
-  const result = await sharp(buffer)
+  const buffer = Buffer.concat(chunks);
+
+  const processed = await sharp(buffer)
     .rotate()
     .resize(640, 640, { fit: "inside" })
     .greyscale()
@@ -128,11 +178,15 @@ async function loadImageFromUrl(url) {
     .toBuffer({ resolveWithObject: true });
 
   return {
-    data: result.data,
-    width: result.info.width,
-    height: result.info.height
+    data: processed.data,
+    width: processed.info.width,
+    height: processed.info.height
   };
 }
+
+/* =========================================================
+   OPENCV HELPERS
+========================================================= */
 
 function makeMat(cv, image) {
   const mat = new cv.Mat(
@@ -160,8 +214,10 @@ async function compareImageUrls(imageUrlA, imageUrlB) {
   try {
     const cv = await getCV();
 
-    if (!cv.ORB || !cv.BFMatcher) {
-      throw new Error("ORB/BFMatcher is unavailable");
+    const ORB = cv.ORB || cv.ORB_create;
+
+    if (!ORB || !cv.BFMatcher) {
+      throw new Error("OpenCV ORB/BFMatcher is unavailable");
     }
 
     const [imageA, imageB] = await Promise.all([
@@ -178,7 +234,9 @@ async function compareImageUrls(imageUrlA, imageUrlB) {
     keypointsB = new cv.KeyPointVector();
     emptyMask = new cv.Mat();
 
-    orb = cv.ORB.create(500);
+    orb = typeof ORB.create === "function"
+      ? ORB.create(500)
+      : new ORB(500);
 
     orb.detectAndCompute(
       matA, emptyMask, keypointsA, descriptorsA
@@ -231,18 +289,26 @@ async function compareImageUrls(imageUrlA, imageUrlB) {
     };
   } finally {
     [
-      matA, matB, descriptorsA, descriptorsB,
-      keypointsA, keypointsB, orb, matcher, matches,
-      emptyMask
+      matA, matB,
+      descriptorsA, descriptorsB,
+      keypointsA, keypointsB,
+      orb, matcher, matches, emptyMask
     ].forEach((item) => {
       if (item && typeof item.delete === "function") {
-        item.delete();
+        try {
+          item.delete();
+        } catch (_) {
+          // Ignore native/WASM cleanup errors.
+        }
       }
     });
   }
 }
 
-// Existing single-pair comparison endpoint
+/* =========================================================
+   COMPARE TWO IMAGES
+========================================================= */
+
 app.post("/compare", async (req, res) => {
   try {
     const { imageUrlA, imageUrlB } = req.body || {};
@@ -259,31 +325,43 @@ app.post("/compare", async (req, res) => {
       imageUrlB
     );
 
-    res.json({
+    return res.json({
       success: true,
       ...result
     });
   } catch (error) {
     console.error("Comparison error:", error.message);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      error: "Image comparison failed"
+      error: "Image comparison failed",
+      details: error.message
     });
   }
 });
 
-// New: scan complaints for possible duplicates
+/* =========================================================
+   FIND POSSIBLE DUPLICATE COMPLAINTS
+========================================================= */
+
 app.get("/duplicate-complaints", async (req, res) => {
   if (!supabase) {
     return res.status(500).json({
       success: false,
-      error: "Supabase environment variables are missing"
+      error: "Supabase environment variables are missing",
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      serviceKeyConfigured: Boolean(supabaseKey)
+    });
+  }
+
+  if (!supabaseHost) {
+    return res.status(500).json({
+      success: false,
+      error: "SUPABASE_HOST is not configured"
     });
   }
 
   try {
-    // Limit keeps this first version manageable on Vercel.
     const { data: complaints, error } = await supabase
       .from("complaints")
       .select(
@@ -296,42 +374,58 @@ app.get("/duplicate-complaints", async (req, res) => {
 
     const groups = new Map();
 
+    let missingLocation = 0;
+    let missingImage = 0;
+    let invalidImageHost = 0;
+    let validImages = 0;
+
     for (const complaint of complaints || []) {
       if (!complaint.hostel_name || !complaint.room_number) {
+        missingLocation++;
         continue;
       }
 
-      if (!complaint.image_url) continue;
+      if (!complaint.image_url) {
+        missingImage++;
+        continue;
+      }
 
-      let imageHost;
+      let imageUrl;
 
       try {
-        imageHost = new URL(complaint.image_url).hostname;
+        imageUrl = new URL(complaint.image_url);
       } catch {
+        invalidImageHost++;
         continue;
       }
 
-      // Skip test URLs and any URL outside our Supabase host.
       if (
-        !supabaseHost ||
-        imageHost !== supabaseHost ||
-        !complaint.image_url.startsWith("https://")
+        imageUrl.protocol !== "https:" ||
+        imageUrl.hostname !== supabaseHost
       ) {
+        invalidImageHost++;
         continue;
       }
+
+      validImages++;
 
       const key = [
         complaint.hostel_name.trim().toLowerCase(),
         complaint.room_number.trim().toLowerCase()
       ].join("::");
 
-      if (!groups.has(key)) groups.set(key, []);
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+
       groups.get(key).push(complaint);
     }
 
     const duplicates = [];
-    const errors = [];
     let comparisons = 0;
+    let failedComparisons = 0;
+    let comparisonLimitReached = false;
+
     const MAX_COMPARISONS = 100;
 
     for (const roomComplaints of groups.values()) {
@@ -339,12 +433,15 @@ app.get("/duplicate-complaints", async (req, res) => {
 
       for (let i = 0; i < roomComplaints.length; i++) {
         for (let j = i + 1; j < roomComplaints.length; j++) {
-          if (comparisons >= MAX_COMPARISONS) break;
+          if (comparisons >= MAX_COMPARISONS) {
+            comparisonLimitReached = true;
+            break;
+          }
 
           const a = roomComplaints[i];
           const b = roomComplaints[j];
 
-          // Avoid comparing the same stored image URL.
+          // Identical stored URLs need no image comparison.
           if (a.image_url === b.image_url) continue;
 
           comparisons++;
@@ -366,43 +463,56 @@ app.get("/duplicate-complaints", async (req, res) => {
               });
             }
           } catch (error) {
+            failedComparisons++;
+
             console.error(
-              `Could not compare complaints ${a.id} and ${b.id}:`,
+              `Comparison failed for complaint IDs ${a.id}, ${b.id}:`,
               error.message
             );
-
-            errors.push({
-              complaintIds: [a.id, b.id],
-              error: "Image comparison failed"
-            });
           }
         }
 
-        if (comparisons >= MAX_COMPARISONS) break;
+        if (comparisons >= MAX_COMPARISONS) {
+          comparisonLimitReached = true;
+          break;
+        }
       }
 
-      if (comparisons >= MAX_COMPARISONS) break;
+      if (comparisons >= MAX_COMPARISONS) {
+        comparisonLimitReached = true;
+        break;
+      }
     }
 
-    res.json({
+    return res.status(200).json({
       success: true,
       scannedComplaints: (complaints || []).length,
+      validImages,
+      missingLocation,
+      missingImage,
+      invalidImageHost,
       comparisons,
-      comparisonLimitReached: comparisons >= MAX_COMPARISONS,
+      comparisonLimitReached,
       duplicateCount: duplicates.length,
       duplicates,
-      failedComparisons: errors.length,
-      message:
-        "Results are possible duplicates, not confirmed duplicates."
+      failedComparisons,
+      message: comparisons === 0
+        ? "No image pairs were compared. Check image URLs and hostel/room grouping."
+        : "Results are possible duplicates, not confirmed duplicates."
     });
   } catch (error) {
     console.error("Duplicate scan error:", error.message);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      error: "Could not scan complaints"
+      error: "Could not scan complaints",
+      details: error.message
     });
   }
 });
+
+/* =========================================================
+   EXPORT FOR VERCEL
+========================================================= */
 
 module.exports = app;
